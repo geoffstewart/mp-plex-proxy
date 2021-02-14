@@ -11,6 +11,19 @@ import threading
 from flask import Flask, Response, request, jsonify, abort, render_template, redirect
 from logging.config import dictConfig
 
+# URL format: <protocol>://<username>:<password>@<hostname>:<port>, example: https://test:1234@localhost:9981
+config = {
+    'bindAddr': '',
+    'argustvURL': os.environ.get('ARGUSTV_URL') or 'http://192.168.1.4:49943',
+    'argustvProxyURL': os.environ.get('PROXY_URL') or 'http://192.168.1.4:8081',
+    'rtspHost' : os.environ.get('RTSP_HOST') or '192.168.1.4',
+    'tunerCount': os.environ.get('TVH_TUNER_COUNT') or 1,  # number of tuners in tvh
+    'tvhWeight': os.environ.get('TVH_WEIGHT') or 300,  # subscription priority
+    'chunkSize': os.environ.get('TVH_CHUNK_SIZE') or 1024*1024,  # usually you don't need to edit this
+    'streamProfile': os.environ.get('TVH_PROFILE') or 'pass',  # specifiy a stream profile that you want to use for adhoc transcoding in tvh, e.g. mp4
+    'loglevel': os.environ.get('LOGLEVEL') or 'INFO'
+}
+
 dictConfig({
     'version': 1,
     'formatters': {'default': {
@@ -22,24 +35,13 @@ dictConfig({
         'formatter': 'default'
     }},
     'root': {
-        'level': 'INFO',
+        'level': config['loglevel'],
         'handlers': ['wsgi']
     }
 })
 
 app = Flask(__name__)
 
-# URL format: <protocol>://<username>:<password>@<hostname>:<port>, example: https://test:1234@localhost:9981
-config = {
-    'bindAddr': '',
-    'argustvURL': os.environ.get('ARGUSTV_URL') or 'http://192.168.1.4:49943',
-    'argustvProxyURL': os.environ.get('PROXY_URL') or 'http://192.168.1.4:8081',
-    'rtspHost' : os.environ.get('RTSP_HOST') or '192.168.1.4',
-    'tunerCount': os.environ.get('TVH_TUNER_COUNT') or 1,  # number of tuners in tvh
-    'tvhWeight': os.environ.get('TVH_WEIGHT') or 300,  # subscription priority
-    'chunkSize': os.environ.get('TVH_CHUNK_SIZE') or 1024*1024,  # usually you don't need to edit this
-    'streamProfile': os.environ.get('TVH_PROFILE') or 'pass'  # specifiy a stream profile that you want to use for adhoc transcoding in tvh, e.g. mp4
-}
 
 # this response is to trick Plex into thinking the tuner is a silicondust card
 discoverData = {
@@ -101,31 +103,49 @@ def record():
     channelId = request.args.get('channel')
     recordResp = None
     try:
+        requestedChannel = _getChannel(channelId)
+        existingLiveStream = _getLiveStream()
         # fill in the record data
         recordData = {
-            'Channel': _getChannel(channelId),
-            'LiveStream': _getLiveStream()
+            'Channel': requestedChannel,
         }
+        app.logger.info("------------------------RECORD channel: %s", requestedChannel['DisplayName'])
+        
+        if existingLiveStream != None:
+            app.logger.info("------------------------STREAM EXISTS: %s", existingLiveStream['Channel']['DisplayName'])
+            # wait for keep alive thread to be set to False - means existing FFMPEG process is done
+            _stopLiveStream()
+            waitForThread = True
+            global keepThreadGoing
+            while waitForThread:
+                app.logger.info("Waiting for existing ffmpeg process to finish and RTSP stream to close...")
+                time.sleep(1)
+                stream = _getLiveStream()                
+                if keepThreadGoing == False and stream == None:
+                    # thread is done and stream is closed
+                    waitForThread = False
         
         # start the recording
         tunelivestreamUrl = '%s/ArgusTV/Control/TuneLiveStream' % (config['argustvURL'])
         headers = {'Content-type': 'application/json'}
         recordResp = requests.post(tunelivestreamUrl, json=recordData, headers=headers)
-        app.logger.info("Record response: %s", recordResp.text)
+        app.logger.debug("Record response: %s", recordResp.text)
 
         j = recordResp.json()
         if j['LiveStreamResult'] == 0:
-            app.logger.info("------------------------RECORD channel: %s", j['LiveStream']['Channel']['DisplayName'])
             time.sleep(3); # let the stream get setup
             vidUrl = j['LiveStream']['RtspUrl']
             app.logger.info("RTSP URL: %s", vidUrl)
 
+            global process
+            app.logger.info("Creating new ffmpeg process")
             process = (
                 ffmpeg
                 .input(vidUrl, format="rtsp")
                 .output('-', format="mpegts", vcodec="copy", acodec="copy", bufsize=config['chunkSize'])
                 .run_async(pipe_stdout=True)
             )
+              
             return Response(
                 _keepReadingFromFfmpeg(process),
                 headers={   
@@ -164,8 +184,8 @@ def _stopLiveStream():
     headers = {'Content-type': 'application/json'}
     stopResp = requests.post(stopStreamUrl, json=_getLiveStream(), headers=headers)
     
-def _keepStreamAlive():
-    app.logger.debug("Keep stream alive")
+def _callKeepStreamAlive():
+    app.logger.debug("Calling keep stream alive")
     keepStreamAliveUrl = '%s/ArgusTV/Control/KeepStreamAlive' % (config['argustvURL'])
     headers = {'Content-type': 'application/json'}
     stream = _getLiveStream()
@@ -183,7 +203,7 @@ def _keepStreamAliveThread():
         # live stream will auto close after 1 minute or so - keep alive every 30 seconds
         time.sleep(30)
         app.logger.debug("Thread function: keep stream alive")
-        _keepStreamAlive()
+        _callKeepStreamAlive()
     
 
 def _keepReadingFromFfmpeg(process):
@@ -204,15 +224,13 @@ def _keepReadingFromFfmpeg(process):
             packet = process.stdout.read(config['chunkSize'])
             yield packet
     finally:
-        app.logger.info("stop stream")
-        _stopLiveStream()
-        app.logger.info("End keepalive thread")
-        keepThreadGoing = False
-        thread.join()
         app.logger.info("End ffmpeg process")
         process.stdout.close()
         process.wait()
-
+        app.logger.info("End keepalive thread")
+        keepThreadGoing = False
+        thread.join()
+    
 def _getChannel(channelId):
     getchannelURL = '%s/ArgusTV/Scheduler/ChannelById/%s' %  (config['argustvURL'], channelId)
     channelResp = requests.get(getchannelURL)

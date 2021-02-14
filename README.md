@@ -15,6 +15,7 @@ docker run -dit -p 8081:80 `
     -e ARGUSTV_URL="http://192.168.1.4:49943" `
     -e PROXY_URL="http://192.168.1.4:8081" `
     -e RTSP_HOST="192.168.1.4" `
+    -e LOGLEVEL="DEBUG" `
     --name mpplexproxy `
     mpplexproxy:latest
 ```
