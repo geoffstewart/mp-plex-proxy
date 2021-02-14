@@ -7,7 +7,7 @@ import logging
 import json
 import ffmpeg
 import re
-# from gevent.pywsgi import WSGIServer
+import threading
 from flask import Flask, Response, request, jsonify, abort, render_template, redirect
 
 app = Flask(__name__)
@@ -16,7 +16,7 @@ app = Flask(__name__)
 config = {
     'bindAddr': '',
     'argustvURL': os.environ.get('ARGUSTV_URL') or 'http://192.168.1.4:49943',
-    'argustvProxyURL': os.environ.get('ARGUSTV_PROXY_URL') or 'http://10.49.1.153',
+    'argustvProxyURL': os.environ.get('PROXY_URL') or 'http://192.168.1.4:8081',
     'rtspHost' : os.environ.get('RTSP_HOST') or '192.168.1.4',
     'tunerCount': os.environ.get('TVH_TUNER_COUNT') or 1,  # number of tuners in tvh
     'tvhWeight': os.environ.get('TVH_WEIGHT') or 300,  # subscription priority
@@ -24,6 +24,7 @@ config = {
     'streamProfile': os.environ.get('TVH_PROFILE') or 'pass'  # specifiy a stream profile that you want to use for adhoc transcoding in tvh, e.g. mp4
 }
 
+# this response is to trick Plex into thinking the tuner is a silicondust card
 discoverData = {
     'FriendlyName': 'mp-plex-proxy',
     'Manufacturer' : 'Silicondust',
@@ -36,6 +37,9 @@ discoverData = {
     'BaseURL': '%s' % config['argustvProxyURL'],
     'LineupURL': '%s/lineup.json' % config['argustvProxyURL']
 }
+
+# global flag to control keep alive thread - assuming just one stream at a time
+keepThreadGoing = False
 
 @app.route('/discover.json')
 def discover():
@@ -75,13 +79,72 @@ def lineup_post():
 def device():
     return render_template('device.xml',data = discoverData),{'Content-Type': 'application/xml'}
 
-def keepReading(process):
-    logging.warning("IN keepReading()")
+def getLiveStream():
+    logging.info("Get live stream")
+    getStreamsUrl = '%s/ArgusTV/Control/GetLiveStreams' % (config['argustvURL'])
+    liveStreams = requests.get(getStreamsUrl)
+    
+    streamsArray = liveStreams.json()
+    
+    # assuming just 1 live stream
+    if len(streamsArray) == 1:
+        return streamsArray[0]
+    else:
+        return None
+      
+def stopLiveStream():
+    logging.info("Stopping live stream")
+    stopStreamUrl = '%s/ArgusTV/Control/StopLiveStream' % (config['argustvURL'])
+    headers = {'Content-type': 'application/json'}
+    stopResp = requests.post(stopStreamUrl, json=getLiveStream(), headers=headers)
+    
+def keepStreamAlive():
+    logging.info("Keep stream alive")
+    keepStreamAliveUrl = '%s/ArgusTV/Control/KeepStreamAlive' % (config['argustvURL'])
+    headers = {'Content-type': 'application/json'}
+    stream=getLiveStream()
+    logging.warning("---------------keep alive request: " + str(stream))
+    aliveResp = requests.post(keepStreamAliveUrl, json=stream, headers=headers)
+    logging.warning("---------------keep alive response: " + aliveResp.text)
+    
+def keepStreamAliveThread():
+    while True:
+        global keepThreadGoing
+        
+        logging.warning("THREAD")
+        if keepThreadGoing == False:
+            logging.warning("Killing keepAliveThread")
+            break
+        # live stream will auto close after 1 minute or so - keep alive every 30 seconds
+        time.sleep(30)
+        logging.warning("Thread function: keep stream alive")
+        keepStreamAlive()
+    
+
+def keepReadingFromFfmpeg(process):
+    logging.info("keepReadingFromFfmpeg")
+    stream = getLiveStream()
+    if stream == None:
+        logging.error("Stream was not found. Exiting")
+        process.stdout.close()
+        process.wait()
+        return
+    global keepThreadGoing 
+    keepThreadGoing = True
+    thread = threading.Thread(target=keepStreamAliveThread)          
     try:
+        # start thread to keep stream alive in Argus
+        thread.start()        
         while process.poll() is None:
             packet = process.stdout.read(config['chunkSize'])
             yield packet
     finally:
+        logging.warning("stop stream")
+        stopLiveStream()
+        logging.warning("End keepalive thread")
+        keepThreadGoing = False
+        thread.join()
+        logging.warning("End ffmpeg process")
         process.stdout.close()
         process.wait()
 
@@ -99,58 +162,30 @@ def record():
             'Channel': json.loads(channel.text)
         }
         
-        logging.warning("recordData: " + str(recordData))
+        logging.info("recordData: " + str(recordData))
         # start the recording
         tunelivestreamUrl = '%s/ArgusTV/Control/TuneLiveStream' % (config['argustvURL'])
         headers = {'Content-type': 'application/json'}
         recordResp = requests.post(tunelivestreamUrl, json=recordData, headers=headers)
-        logging.warning("Record response: " + recordResp.text)
+        logging.info("Record response: " + recordResp.text)
 
-        # Response format:
-        # {
-        #     "LiveStream": {
-        #         "CardId": "4", 
-        #         "Channel": {
-        #         "BroadcastStart": null, 
-        #         "BroadcastStop": null, 
-        #         "ChannelId": "840d61cd-5e47-4464-9518-fbcf474d3fb1", 
-        #         "ChannelType": 0, 
-        #         "CombinedDisplayName": "30 - 30 TSN5", 
-        #         "DefaultPostRecordSeconds": null, 
-        #         "DefaultPreRecordSeconds": null, 
-        #         "DisplayName": "30 TSN5", 
-        #         "GuideChannelId": "b6eee01d-4074-48fc-a543-0cebf5b0feb1", 
-        #         "Id": 446, 
-        #         "LogicalChannelNumber": 30, 
-        #         "Sequence": 1, 
-        #         "Version": 24, 
-        #         "VisibleInGuide": true
-        #         }, 
-        #         "RecorderTunerId": "134d41e5-deac-4cf3-b9b6-efd931fbc05b", 
-        #         "RtspUrl": "rtsp://homer:554/stream4.0", 
-        #         "StreamLastAliveTimeUtc": "/Date(1612735516880)/", 
-        #         "StreamStartedTime": "/Date(1612735516880-0500)/", 
-        #         "TimeshiftFile": "\\\\HOMER\\homerd\\mptvdtimeshift\\live4-0.tsbuffer"
-        #     }, 
-        #     "LiveStreamResult": 0
-        # }
         j = recordResp.json()
         if j['LiveStreamResult'] == 0:
             time.sleep(3); # let the stream get setup
             vidUrl = j['LiveStream']['RtspUrl']
             # name resolution may not work, so replace with provided ip
-            vidUrl = re.sub("rtsp://\w*:554", "rtsp://%s:554" % config['rtspHost'] , vidUrl)
+            # vidUrl = re.sub("rtsp://\w*:554", "rtsp://%s:554" % config['rtspHost'] , vidUrl)
             logging.warning("RTSP URL: " + vidUrl)
 
             logging.warning("------------------------RECORD--------------------------------")
             process = (
                 ffmpeg
-                .input(vidUrl, r="29.97", format="rtsp")
-                .output('-', r="29.97", format="mpegts", vcodec="copy", acodec="copy", bufsize=config['chunkSize'])
+                .input(vidUrl, format="rtsp")
+                .output('-', format="mpegts", vcodec="copy", acodec="copy", bufsize=config['chunkSize'])
                 .run_async(pipe_stdout=True)
             )
             return Response(
-                keepReading(process),
+                keepReadingFromFfmpeg(process),
                 headers={   
                     'Cache-Control': 'no-cache',
                     'Pragma': 'no-cache',
@@ -180,6 +215,8 @@ def _get_channels():
 
 
 if __name__ == '__main__':
+    format = "%(asctime)s: %(message)s"
+    logging.basicConfig(format=format, level=logging.INFO,
+                        datefmt="%H:%M:%S")
+
     app.run(host ="0.0.0.0", port=5004, threaded=True)
-    # http = WSGIServer((config['bindAddr'], 5004), app.wsgi_app)
-    # http.serve_forever()
