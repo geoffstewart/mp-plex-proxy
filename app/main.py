@@ -9,6 +9,23 @@ import ffmpeg
 import re
 import threading
 from flask import Flask, Response, request, jsonify, abort, render_template, redirect
+from logging.config import dictConfig
+
+dictConfig({
+    'version': 1,
+    'formatters': {'default': {
+        'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
+    }},
+    'handlers': {'wsgi': {
+        'class': 'logging.StreamHandler',
+        'stream': 'ext://flask.logging.wsgi_errors_stream',
+        'formatter': 'default'
+    }},
+    'root': {
+        'level': 'INFO',
+        'handlers': ['wsgi']
+    }
+})
 
 app = Flask(__name__)
 
@@ -78,9 +95,58 @@ def lineup_post():
 @app.route('/device.xml')
 def device():
     return render_template('device.xml',data = discoverData),{'Content-Type': 'application/xml'}
+  
+@app.route('/record', methods=['GET'])
+def record():
+    channelId = request.args.get('channel')
+    recordResp = None
+    try:
+        # fill in the record data
+        recordData = {
+            'Channel': _getChannel(channelId),
+            'LiveStream': _getLiveStream()
+        }
+        
+        # start the recording
+        tunelivestreamUrl = '%s/ArgusTV/Control/TuneLiveStream' % (config['argustvURL'])
+        headers = {'Content-type': 'application/json'}
+        recordResp = requests.post(tunelivestreamUrl, json=recordData, headers=headers)
+        app.logger.info("Record response: %s", recordResp.text)
 
-def getLiveStream():
-    logging.info("Get live stream")
+        j = recordResp.json()
+        if j['LiveStreamResult'] == 0:
+            app.logger.info("------------------------RECORD channel: %s", j['LiveStream']['Channel']['DisplayName'])
+            time.sleep(3); # let the stream get setup
+            vidUrl = j['LiveStream']['RtspUrl']
+            app.logger.info("RTSP URL: %s", vidUrl)
+
+            process = (
+                ffmpeg
+                .input(vidUrl, format="rtsp")
+                .output('-', format="mpegts", vcodec="copy", acodec="copy", bufsize=config['chunkSize'])
+                .run_async(pipe_stdout=True)
+            )
+            return Response(
+                _keepReadingFromFfmpeg(process),
+                headers={   
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Content-Type': 'video/mp4'
+                },
+
+                )
+        else:
+            app.logger.error("Could not record: %s", "Unknown error" if recordResp == None else recordResp.text)
+            return Response("{'error':'could not setup tuner'}", status=500, mimetype='application/json')
+
+    except Exception as e:
+        app.logger.error("Could not start recording: %s", repr(e))
+        return Response("{'error':'" + repr(e) + "'}", status=500, mimetype='application/json')
+
+    return ''
+
+def _getLiveStream():
+    app.logger.debug("Get live stream")
     getStreamsUrl = '%s/ArgusTV/Control/GetLiveStreams' % (config['argustvURL'])
     liveStreams = requests.get(getStreamsUrl)
     
@@ -92,46 +158,45 @@ def getLiveStream():
     else:
         return None
       
-def stopLiveStream():
-    logging.info("Stopping live stream")
+def _stopLiveStream():
+    app.logger.info("Stopping live stream")
     stopStreamUrl = '%s/ArgusTV/Control/StopLiveStream' % (config['argustvURL'])
     headers = {'Content-type': 'application/json'}
-    stopResp = requests.post(stopStreamUrl, json=getLiveStream(), headers=headers)
+    stopResp = requests.post(stopStreamUrl, json=_getLiveStream(), headers=headers)
     
-def keepStreamAlive():
-    logging.info("Keep stream alive")
+def _keepStreamAlive():
+    app.logger.debug("Keep stream alive")
     keepStreamAliveUrl = '%s/ArgusTV/Control/KeepStreamAlive' % (config['argustvURL'])
     headers = {'Content-type': 'application/json'}
-    stream=getLiveStream()
-    logging.warning("---------------keep alive request: " + str(stream))
+    stream = _getLiveStream()
+    app.logger.debug("---------------keep alive request: %s", str(stream))
     aliveResp = requests.post(keepStreamAliveUrl, json=stream, headers=headers)
-    logging.warning("---------------keep alive response: " + aliveResp.text)
+    app.logger.debug("---------------keep alive response: %s", aliveResp.text)
     
-def keepStreamAliveThread():
+def _keepStreamAliveThread():
     while True:
         global keepThreadGoing
         
-        logging.warning("THREAD")
         if keepThreadGoing == False:
-            logging.warning("Killing keepAliveThread")
+            app.logger.info("Killing keepAliveThread")
             break
         # live stream will auto close after 1 minute or so - keep alive every 30 seconds
         time.sleep(30)
-        logging.warning("Thread function: keep stream alive")
-        keepStreamAlive()
+        app.logger.debug("Thread function: keep stream alive")
+        _keepStreamAlive()
     
 
-def keepReadingFromFfmpeg(process):
-    logging.info("keepReadingFromFfmpeg")
-    stream = getLiveStream()
+def _keepReadingFromFfmpeg(process):
+    app.logger.debug("keepReadingFromFfmpeg")
+    stream = _getLiveStream()
     if stream == None:
-        logging.error("Stream was not found. Exiting")
+        app.logger.error("Stream was not found. Exiting")
         process.stdout.close()
         process.wait()
         return
     global keepThreadGoing 
     keepThreadGoing = True
-    thread = threading.Thread(target=keepStreamAliveThread)          
+    thread = threading.Thread(target=_keepStreamAliveThread)          
     try:
         # start thread to keep stream alive in Argus
         thread.start()        
@@ -139,69 +204,20 @@ def keepReadingFromFfmpeg(process):
             packet = process.stdout.read(config['chunkSize'])
             yield packet
     finally:
-        logging.warning("stop stream")
-        stopLiveStream()
-        logging.warning("End keepalive thread")
+        app.logger.info("stop stream")
+        _stopLiveStream()
+        app.logger.info("End keepalive thread")
         keepThreadGoing = False
         thread.join()
-        logging.warning("End ffmpeg process")
+        app.logger.info("End ffmpeg process")
         process.stdout.close()
         process.wait()
 
-@app.route('/record', methods=['GET'])
-def record():
-    channelId = request.args.get('channel')
-
-    try:
-        # get the channel info
-        getchannelURL = '%s/ArgusTV/Scheduler/ChannelById/%s' %  (config['argustvURL'], channelId)
-        channel = requests.get(getchannelURL)
-
-        logging.warning("Channel response: " + str(channel.text))
-        recordData = {
-            'Channel': json.loads(channel.text)
-        }
-        
-        logging.info("recordData: " + str(recordData))
-        # start the recording
-        tunelivestreamUrl = '%s/ArgusTV/Control/TuneLiveStream' % (config['argustvURL'])
-        headers = {'Content-type': 'application/json'}
-        recordResp = requests.post(tunelivestreamUrl, json=recordData, headers=headers)
-        logging.info("Record response: " + recordResp.text)
-
-        j = recordResp.json()
-        if j['LiveStreamResult'] == 0:
-            time.sleep(3); # let the stream get setup
-            vidUrl = j['LiveStream']['RtspUrl']
-            # name resolution may not work, so replace with provided ip
-            # vidUrl = re.sub("rtsp://\w*:554", "rtsp://%s:554" % config['rtspHost'] , vidUrl)
-            logging.warning("RTSP URL: " + vidUrl)
-
-            logging.warning("------------------------RECORD--------------------------------")
-            process = (
-                ffmpeg
-                .input(vidUrl, format="rtsp")
-                .output('-', format="mpegts", vcodec="copy", acodec="copy", bufsize=config['chunkSize'])
-                .run_async(pipe_stdout=True)
-            )
-            return Response(
-                keepReadingFromFfmpeg(process),
-                headers={   
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache',
-                    'Content-Type': 'video/mp4'
-                },
-
-                )
-        else:
-            logging.error("Could not record")
-            return Response("{'error':'could not setup tuner'}", status=500, mimetype='application/json')
-
-    except Exception as e:
-        logging.error("Could not start recording:" + repr(e))
-        return Response("{'error':'" + repr(e) + "'}", status=500, mimetype='application/json')
-
-    return ''
+def _getChannel(channelId):
+    getchannelURL = '%s/ArgusTV/Scheduler/ChannelById/%s' %  (config['argustvURL'], channelId)
+    channelResp = requests.get(getchannelURL)
+    app.logger.debug("Channel response: %s", str(channelResp.json()))
+    return channelResp.json()
 
 def _get_channels():
     url = '%s/ArgusTV/Scheduler/Channels/0' % config['argustvURL']
@@ -211,12 +227,7 @@ def _get_channels():
         return r.json()
 
     except Exception as e:
-        print('An error occured: ' + repr(e))
-
+        app.logger.error('An error occured: %s', repr(e))
 
 if __name__ == '__main__':
-    format = "%(asctime)s: %(message)s"
-    logging.basicConfig(format=format, level=logging.INFO,
-                        datefmt="%H:%M:%S")
-
     app.run(host ="0.0.0.0", port=5004, threaded=True)
