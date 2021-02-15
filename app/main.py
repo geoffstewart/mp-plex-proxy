@@ -137,7 +137,6 @@ def record():
             vidUrl = j['LiveStream']['RtspUrl']
             app.logger.info("RTSP URL: %s", vidUrl)
 
-            global process
             app.logger.info("Creating new ffmpeg process")
             process = (
                 ffmpeg
