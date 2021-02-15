@@ -100,6 +100,11 @@ def device():
   
 @app.route('/record', methods=['GET'])
 def record():
+    app.logger.debug("RECORD request endpoint:\n%s", request.endpoint)
+    app.logger.debug("RECORD request method: \n%s", request.method)
+    app.logger.debug("RECORD request headers: \n%s", request.headers)
+    app.logger.debug("RECORD request args: \n%s", request.args)
+    app.logger.debug("RECORD request remote_addr: \n%s", request.remote_addr)
     channelId = request.args.get('channel')
     recordResp = None
     try:
@@ -133,7 +138,6 @@ def record():
 
         j = recordResp.json()
         if j['LiveStreamResult'] == 0:
-            time.sleep(3); # let the stream get setup
             vidUrl = j['LiveStream']['RtspUrl']
             app.logger.info("RTSP URL: %s", vidUrl)
 
@@ -178,10 +182,11 @@ def _getLiveStream():
         return None
       
 def _stopLiveStream():
-    app.logger.info("Stopping live stream")
+    app.logger.debug("Stopping live stream")
     stopStreamUrl = '%s/ArgusTV/Control/StopLiveStream' % (config['argustvURL'])
     headers = {'Content-type': 'application/json'}
     stopResp = requests.post(stopStreamUrl, json=_getLiveStream(), headers=headers)
+    app.logger.debug("StopLiveStream response: %s", stopResp.status_code)
     
 def _callKeepStreamAlive():
     app.logger.debug("Calling keep stream alive")
@@ -191,6 +196,7 @@ def _callKeepStreamAlive():
     app.logger.debug("---------------keep alive request: %s", str(stream))
     aliveResp = requests.post(keepStreamAliveUrl, json=stream, headers=headers)
     app.logger.debug("---------------keep alive response: %s", aliveResp.text)
+    return aliveResp.json()
     
 def _keepStreamAliveThread():
     while True:
@@ -202,7 +208,11 @@ def _keepStreamAliveThread():
         # live stream will auto close after 1 minute or so - keep alive every 30 seconds
         time.sleep(30)
         app.logger.debug("Thread function: keep stream alive")
-        _callKeepStreamAlive()
+        resp = _callKeepStreamAlive()
+        if resp['IsAlive'] == False:
+            keepThreadGoing = False
+            app.logger.info("keepAliveThread found stream was off; exiting")
+            break
     
 
 def _keepReadingFromFfmpeg(process):
@@ -223,6 +233,8 @@ def _keepReadingFromFfmpeg(process):
             packet = process.stdout.read(config['chunkSize'])
             yield packet
     finally:
+        app.logger.info("Stop stream")
+        _stopLiveStream()
         app.logger.info("End ffmpeg process")
         process.stdout.close()
         process.wait()
