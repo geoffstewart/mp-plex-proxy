@@ -12,13 +12,16 @@ docker run -dit -p 8081:80 `
     -e RTSP_HOST="192.168.1.4" `
     -e LOGLEVEL="DEBUG" `
     --name mpplexproxy `
-    geoffstewart/mpplexproxy:latest
+    geoffstewart/mpplexproxy:latest-alpine
 ```
+
+A non-alpine version also exists: geoffstewart/mpplexproxy:latest
+
 This will download the container locally and run it in the background.
 
 If you want to tinker with the code and build it yourself, clone the repo or download the zip and enter the mp-plex-proxy directory. To build the container:
 ```
-docker build --pull --rm -f "Dockerfile" -t mpplexproxy:latest "."
+docker build --pull --rm -f "Dockerfile.alpine" -t mpplexproxy:latest-alpine "."
 ```
 
 Running from the locally built version is very similar to above except that you reference the local version tag.
@@ -30,6 +33,6 @@ docker run -dit -p 8081:80 `
     -e RTSP_HOST="192.168.1.4" `
     -e LOGLEVEL="DEBUG" `
     --name mpplexproxy `
-    mpplexproxy:latest
+    mpplexproxy:latest-alpine
 ```
 
